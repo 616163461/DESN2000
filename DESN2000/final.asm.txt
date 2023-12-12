@@ -1,0 +1,1620 @@
+; This program implements a timer that counts one second using
+; Timer0 interrupt
+.include "m2560def.inc"
+.equ PATTERN = 0b11110000
+.def temp = r16
+.def row =r17
+.def col =r18
+.def mask =r19
+.def temp2 =r20
+.def LCDUSAGE = r21
+.def req_floor = r22
+.equ PORTLDIR = 0xF0
+.equ INITCOLMASK = 0xEF
+.equ INITROWMASK = 0x01
+.equ ROWMASK = 0x0F
+.equ LCD_RS = 7
+.equ LCD_E = 6
+.equ LCD_RW = 5
+.equ LCD_BE = 4
+
+; The macro clears a word (2 bytes) in a memory
+; the parameter @0 is the memory address for that word
+.macro clear
+	; load the memory address to Y
+	; clear the two bytes at @0 in SRAM
+	ldi YL, low(@0) 
+	ldi YH, high(@0) 
+	clr temp
+	st Y+, temp 
+	st Y, temp
+.endmacro
+
+.macro do_lcd_command
+	ldi LCDUSAGE, @0
+	rcall lcd_command
+	rcall lcd_wait
+.endmacro
+
+.macro do_lcd_data
+	ldi LCDUSAGE, @0
+	rcall lcd_data
+	rcall lcd_wait
+.endmacro
+
+.macro lcd_set
+	sbi PORTA, @0
+.endmacro
+
+.macro lcd_clr
+	cbi PORTA, @0
+.endmacro
+
+.dseg 
+
+; keeps track of the current floor contians numbers from 1 to 10
+current_floor: 
+	.byte 1
+; contains whether the the lift is going up or down, I for up and 0 for down
+movement: 
+	.byte 1
+SecondCounter:
+	.byte 2 
+TempCounter:
+	.byte 2 ; Temporary counter. Used to determine
+			; if one second has passed
+; array to hold the requests
+request_array: 
+	.byte 11
+; array to contain the floors that are above the current floor
+up_array: 
+	.byte 11
+; array to contain the floors that are below the current floor
+down_array: 
+	.byte 11
+; track whether the elevator is an emergency. 0 is no emergency and 1 is emergency
+emergency_mode:
+	.byte 1
+; track whether to check for input 0 don't check and 1 for check
+check_code_blue_number:
+	.byte 1
+; track whether the elevator is an code blue. 0 is no emergency and 1 is emergency
+code_blue_mode:
+	.byte 1
+; tracks whether there is clearance with 1 being to clear and 1 to actiavte
+emergency_clearance_mode:
+	.byte 1
+; status to flag if a elevator has reacehd a floor with 0 being not reached and 1 being reached 
+floor_reached:
+	.byte 1
+; status flag to show that the elevator is open with being 1 being open  and 0 any other condition
+open_doors:
+	.byte 1
+; status flag to show that the elevator is waiting with being 1 being waitinng and 0 any other condition
+hold_doors:
+	.byte 1
+; status flag to show that the elevator is closing with being 1 being closing and 0 any other condition
+close_doors:
+	.byte 1
+
+
+.cseg
+.org 0x0000 
+	jmp RESET 
+	jmp DEFAULT 
+	jmp DEFAULT
+.org OVF0addr 
+	jmp Timer0OVF	; Jump to the interrupt handler for
+					; Timer0 overflow.
+
+	jmp DEFAULT	; default service for all other interrupts.
+
+DEFAULT: reti ; no service
+
+RESET: 
+	ldi temp, high(RAMEND)	; Initialize stack pointer
+	out SPH, temp
+	ldi temp, low(RAMEND)
+	out SPL, temp
+	
+	ser temp ; set Port C as output
+	out DDRC, temp
+	out DDRG, temp
+
+	ldi temp, low(RAMEND)
+	out SPL, temp
+	ldi temp, high(RAMEND)
+	out SPH, temp
+	ldi temp, PORTLDIR ; columns are outputs, rows are inputs
+	STS DDRL, temp     ; cannot use out
+	ser temp
+	out DDRC, temp ; Make PORTC all outputs
+	out DDRG, temp ; Make PORTG all outputs
+
+	ser LCDUSAGE
+	out DDRF, LCDUSAGE
+	out DDRA, LCDUSAGE
+	clr LCDUSAGE
+	out PORTF, LCDUSAGE
+	out PORTA, LCDUSAGE
+
+	do_lcd_command 0b00111000 ; 2x5x7
+	rcall sleep_5ms
+	do_lcd_command 0b00111000 ; 2x5x7
+	rcall sleep_1ms
+	do_lcd_command 0b00111000 ; 2x5x7
+	do_lcd_command 0b00111000 ; 2x5x7
+	do_lcd_command 0b00001000 ; display off?
+	do_lcd_command 0b00000001 ; clear display
+	do_lcd_command 0b00000110 ; increment, no display shift
+	do_lcd_command 0b00001110 ; Cursor on, bar, no blink
+
+	rjmp main
+
+Timer0OVF: ; interrupt subroutine to Timer0
+	in temp, SREG 
+	push temp 
+	push YH
+	push YL
+	push ZH
+	push ZL
+	push r25 
+	push r24
+
+	; chek if the floor has been reached
+	ldi YH, high(floor_reached)
+	ldi YL, low(floor_reached)
+	ld r24, Y
+	;if floor is not reached continue as normal
+	cpi r24, 1
+	brne do_not_wait
+
+	lds r24, TempCounter
+	lds r25, TempCounter+1
+	adiw r25:r24, 1 ; Increase the temporary counter by one.
+
+	; if timer is above 4 seconds initate the closing doors
+	cpi r24, low(31248) ; Check if (r25:r24) = 7812 * 4
+	ldi temp, high(31248) ; 7812 * 2 = 106/128 * 4
+	cpc r25, temp 
+	brsh set_closing_period
+
+	; if timer is between 4 and 1 sec intiate the waiting period
+	cpi r24, low(7812) ; Check if (r25:r24) = 7812 * 1
+	ldi temp, high(7812) ; 7812 * 2 = 106/128 * 1
+	cpc r25, temp 
+	brsh set_holding_period
+
+	; starts the closing phase and exits
+set_closing_period:
+	rcall set_close_doors
+	rjmp five_sec_con
+
+	; starts the holding phase and exits
+set_holding_period:
+	rcall set_hold_doors
+	rjmp five_sec_con
+
+	; continuation of the 5 second timer
+five_sec_con:
+	; check if time is above 5 seconds
+	cpi r24, low(39060) ; Check if (r25:r24) = 7812 * 5
+	ldi temp, high(39060) ; 7812 * 2 = 106/128 * 5
+	cpc r25, temp 
+	brne NotSecond
+
+	; if  more than 5 seconds set the floor reached status flag back to 0
+	; so the timer can back to 2 seconds
+	ldi YH, high(floor_reached)
+	ldi YL, low(floor_reached)
+	ldi r16, 0
+	st Y, r16
+
+	; stop the motor
+	ldi r18, 0x00
+	sts OCR3BH, r18
+	sts OCR3BL, r18
+	ldi r18,(1<<CS30)
+	sts TCCR3B, r18
+	ldi r18,(1<<WGM30)|(1<<COM3B1)
+	sts TCCR3A, r18
+	
+	rjmp done
+
+do_not_wait:
+	; Load the value of the temporary counter.
+	lds r24, TempCounter
+	lds r25, TempCounter+1
+	adiw r25:r24, 1 ; Increase the temporary counter by one.
+
+	cpi r24, low(15624) ; Check if (r25:r24) = 7812 * 2
+	ldi temp, high(15624) ; 7812 * 2 = 106/128 * 2
+
+	cpc r25, temp 
+	brne NotSecond 
+	
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	;function to change the floor
+	rcall change_floor
+
+	;function to call to check if we have reached a request
+	rcall check_floor_reached
+
+	; create a binary pattern on led based on current floor
+	rcall create_binary_patterns	
+done:
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	clear TempCounter ; Reset the temporary counter.
+
+	; Load the value of the second counter.
+	lds r24, SecondCounter 
+	lds r25, SecondCounter+1
+	adiw r25:r24, 1 ; Increase the second counter by one.
+
+	sts SecondCounter, r24 
+	sts SecondCounter+1, r25 
+	rjmp EndIF
+
+NotSecond:
+	; Store the new value of the temporary counter.
+	sts TempCounter, r24
+	sts TempCounter+1, r25
+
+EndIF:
+	; Epilogue starts;
+	; Restore all conflict registers from the stack.	
+	pop r24 
+	pop r25
+	pop ZL 
+	pop ZH 
+	pop YL 
+	pop YH 
+	pop temp
+	out SREG, temp 
+	reti ; Return from the interrupt.
+
+main:
+
+	LEDvalues: .DB 0b0000000000, 0b0000000001, 0b0000000011, 0b0000000111, 0b0000001111, 0b0000011111, 0b0000111111, 0b0001111111, 0b0011111111, 0b0111111111, 0b1111111111, 0x00
+	
+	clr r0
+	clr r16
+	clr r17
+	clr r18
+	clr r20
+	clr r21
+	clr r22
+	clr r23
+	clr YL
+	clr YH
+	clr ZL
+	clr ZH
+
+	ldi YL, low(RAMEND)
+	ldi YH, high(RAMEND)
+	out SPL, YL
+	out SPH, YH
+
+load_desg_values:
+	; the following code is used to intialise the elevator for use
+
+
+	; used to set the current floor
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ldi r16, 5	
+	st Y, r16
+
+	; set the emergency to none at the start
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ldi r16, 0
+	st Y, r16
+
+	; set default movement to go up
+	ldi YH, high(movement)
+	ldi YL, low(movement)
+	ldi r16, 1		;1 is up and 0 is down
+	st Y, r16
+
+	; set to 0
+	ldi YH, high(floor_reached)
+	ldi YL, low(floor_reached)
+	ldi r16, 0	;1 is up and 0 is down
+	st Y, r16
+
+	; set check to 0
+	ldi YH, high(check_code_blue_number)
+	ldi YL, low(check_code_blue_number)
+	ldi r16, 0		;0 is don't check and 1 is check
+	st Y, r16
+
+	; set code blue to 0
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ldi r16, 0		;0 is deactivate and 1 active
+	st Y, r16
+
+	; set emergency clearance to 0
+	ldi YH, high(emergency_clearance_mode)
+	ldi YL, low(emergency_clearance_mode)
+	ldi r16, 0		;0 is deactivate and 1 active
+	st Y, r16
+
+	
+	; set open door to 0
+	ldi YH, high(open_doors)
+	ldi YL, low(open_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set close door to 0
+	ldi YH, high(close_doors)
+	ldi YL, low(close_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set hold door to 0
+	ldi YH, high(hold_doors)
+	ldi YL, low(hold_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; clear all reserved data of  
+	rcall set_0_request_array
+
+	; intitliase the leds
+	ser r19
+	out DDRG, r19
+	out DDRC, r19
+
+	; Initialize the temporary counter to 0
+	; Initialize the second counter to 0
+	; ldi leds, 0xFF 
+	; out PORTC, leds 
+	; ldi leds, PATTERN 
+	clear TempCounter
+	clear SecondCounter
+	ldi temp, 0b00000000 
+	out TCCR0A, temp
+	ldi temp, 0b00000010 
+	out TCCR0B, temp
+	ldi temp, 1<<TOIE0 
+	sts TIMSK0, temp 
+	sei
+
+	//setup motor
+	ser r18
+	out DDRE, r18
+	clr r18
+
+	;set up the interrupt
+	ldi r21, (2 << ISC10)
+	sts EICRA, r21
+	in r21, EIMSK
+	ori r21, (1 << INT0)
+	out EIMSK, r21
+	ldi r21, (2 << ISC00)
+	sts EICRA, r21
+	in r21, EIMSK
+	ori r21, (1 << INT1)
+	out EIMSK, r21
+	
+;|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+pin_main:
+
+	ldi mask, INITCOLMASK ; initial column mask
+	clr col ; initial column
+
+colloop:
+	STS PORTL, mask ; set column to mask value
+	; (sets column 0 off)
+	ldi temp, 0xFF ; implement a delay so the
+	; hardware can stabilize
+	
+delay:
+	dec temp
+	brne delay
+	LDS temp, PINL ; read PORTL. Cannot use in 
+	andi temp, ROWMASK ; read only the row bits
+	cpi temp, 0xF ; check if any rows are grounded
+	breq nextcol ; if not go to the next column
+	ldi mask, INITROWMASK ; initialise row check
+	clr row ; initial row
+	
+rowloop:      
+	mov temp2, temp
+	and temp2, mask ; check masked bit
+	brne skipconv ; if the result is non-zero,
+	; we need to look again
+	rcall convert ; if bit is clear, convert the bitcode
+	jmp pin_main ; and start again
+	
+skipconv:
+	inc row ; else move to the next row
+	lsl mask ; shift the mask to the next bit
+	jmp rowloop          
+
+nextcol:     
+	cpi col, 3 ; check if we are on the last column
+	breq pin_main ; if so, no buttons were pushed,
+	; so start again.
+	; else shift the column mask:
+	sec ; We must set the carry bit
+	rol mask ; and then rotate left by a bit,
+	; shifting the carry into
+	; bit zero. We need this to make
+	; sure all the rows have
+	; pull-up resistors
+	inc col ; increment column value
+	jmp colloop ; and check the next column
+	; convert function converts the row and column given to a
+	; binary number and also outputs the value to PORTC.
+	; Inputs come from registers row and col and output is in
+	; temp.
+	
+convert:
+	cpi col, 3 ; if column is 3 we have a letter
+	breq letters
+	cpi row, 3 ; if row is 3 we have a symbol or 0
+	breq symbols
+	mov temp, row ; otherwise we have a number (1-9)
+	lsl temp ; temp = row * 2
+	add temp, row ; temp = row * 3
+	add temp, col ; add the column address
+	; to get the offset from 1
+	inc temp ; add 1. Value of switch is
+	; row*3 + col + 1.
+	jmp convert_end
+	
+letters:
+	; if letter is A call the letter_A function
+	cpi row, 0
+	breq letter_A 
+	
+	ldi temp, 0xA
+	add temp, row ; increment from 0xA by the row value
+	jmp convert_end
+
+letter_A:
+	; if not in cleaance mode set the clearance mode 
+	ldi YH, high(emergency_clearance_mode)
+	ldi YL, low(emergency_clearance_mode)
+	ld r16, Y
+	cpi r16, 0
+	breq enact_emergency_clearance
+	; if clearance is alrady set call to deactivate
+	cpi r16, 1
+	breq deactivate_emergency_clearance
+
+enact_emergency_clearance:
+	; set emergency clearnce to active
+	ldi YH, high(emergency_clearance_mode)
+	ldi YL, low(emergency_clearance_mode)
+	ldi r16, 1
+	st Y, r16
+	
+	; display the clearnce message
+	rcall display_clearance_messg
+
+	jmp pin_main
+deactivate_emergency_clearance:
+	; deactivate the clearance mode
+	ldi YH, high(emergency_clearance_mode)
+	ldi YL, low(emergency_clearance_mode)
+	ldi r16, 0 
+	st Y, r16
+
+	jmp pin_main
+	
+symbols:
+	cpi col, 0 ; check if we have a star
+	breq star
+	cpi col, 1 ; or if we have zero
+	breq zero
+	cpi col, 2	; check we hash
+	breq hash
+	ldi temp, 0xF ; we'll output 0xF for hash
+	jmp convert_end
+
+hash:
+	; if hash and code blue is not active
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ld r16, Y
+	cpi r16, 0
+	breq activate_code_blue
+
+activate_code_blue:
+	; activate code blue and 
+	ldi YH, high(check_code_blue_number)
+	ldi YL, low(check_code_blue_number)
+	ldi r16, 1
+	st Y, r16
+
+	jmp pin_main
+	
+; enacts or deactivates the emergency sequence of the elevator
+star:
+	; checks whether the current status of the emerency and acts accordingly
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ld r16, Y
+	cpi r16, 0
+	breq enact_emergency
+
+	rjmp deactivate_emergency
+	
+enact_emergency:
+	; the case the emeregncy needs to be activated; clear the requested floors, insert into the moving floors and then set the status flag for emregncy
+	rcall set_0_request_array
+	ldi req_floor, 1	
+	rcall insert_in_arrays
+
+	; set the emergency mode on
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ldi r16, 1
+	st Y, r16
+
+	; call message for emergency
+	rcall create_movement_message
+
+	jmp pin_main
+deactivate_emergency:
+	; the case of decaivation of emregncy mode; set emergency flag to 0
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ldi r16, 0
+	st Y, r16
+
+	jmp pin_main
+	
+zero:
+	clr temp ; set to zero
+	
+convert_end:
+
+	cpi temp, 0
+	brne convert_end_continue
+	ldi temp, 10
+
+convert_end_continue:
+	mov req_floor, temp
+	rcall insert_in_arrays
+
+; |||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+create_binary_patterns:
+	; fucntion protain to the displaying of the lead lights based on the current level the elevator is on
+	push ZH
+	push ZL
+	push YH
+	push YL
+	push r16
+	push r20
+	push r0
+	
+	; load the led constant adress
+	ldi ZH, high(LEDvalues << 1)
+	ldi ZL, low(LEDvalues << 1)
+
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+
+	; since 9 and 10 have special combinations call respective function to display these patterns
+	cpi r16, 9
+	breq LEDvalIsNine
+	cpi r16, 10
+	breq LEDvalIsTen
+
+	; if below 9 get the appropririate led by adding the floor number onto the LEDvalues adress as the levels are stored in order
+	add ZL, r16
+	adc ZH, r0
+
+	; display the led of the floor
+	lpm r20, Z
+	out PORTC, r20
+	ldi r20, 0x00
+	out PORTG, r20
+
+create_binary_patterns_epi:
+	; return call
+	pop r0
+	pop r20
+	pop r16
+	pop YL
+	pop YH
+	pop ZL
+	pop ZH
+
+	ret
+
+LEDvalIsNine:
+	; output on led if the current floor is 9
+	ldi r21, 0x01
+	ldi r23, 0xFF
+	out PORTC, r23
+	out PORTG, r21
+	rjmp create_binary_patterns_epi
+
+LEDvalIsTen:
+	; output on led if the current floor is 10
+	ldi r21, 0x03
+	ldi r23, 0xFF
+	out PORTC, r23
+	out PORTG, r21
+	rjmp create_binary_patterns_epi
+
+;||||||||||||||||||||||||||||||||||||||||||||||||||||
+lcd_command:
+	out PORTF, LCDUSAGE
+	rcall sleep_1ms
+	lcd_set LCD_E
+	rcall sleep_1ms
+	lcd_clr LCD_E
+	rcall sleep_1ms
+	ret
+
+lcd_data:
+	out PORTF, LCDUSAGE
+	lcd_set LCD_RS
+	rcall sleep_1ms
+	lcd_set LCD_E
+	rcall sleep_1ms
+	lcd_clr LCD_E
+	rcall sleep_1ms
+	lcd_clr LCD_RS
+	ret
+
+lcd_wait:
+	push LCDUSAGE
+	clr LCDUSAGE
+	out DDRF, LCDUSAGE
+	out PORTF, LCDUSAGE
+	lcd_set LCD_RW
+
+lcd_wait_loop:
+	rcall sleep_1ms
+	lcd_set LCD_E
+	rcall sleep_1ms
+	in LCDUSAGE, PINF
+	lcd_clr LCD_E
+	sbrc LCDUSAGE, 7
+	rjmp lcd_wait_loop
+	lcd_clr LCD_RW
+	ser LCDUSAGE
+	out DDRF, LCDUSAGE
+	pop LCDUSAGE
+	ret
+
+.equ F_CPU = 16000000
+.equ DELAY_1MS = F_CPU / 4 / 1000 - 4
+; 4 cycles per iteration - setup/call-return overhead
+
+sleep_1ms:
+	push r24
+	push r25
+	ldi r25, high(DELAY_1MS)
+	ldi r24, low(DELAY_1MS)
+delayloop_1ms:
+	sbiw r25:r24, 1
+	brne delayloop_1ms
+	pop r25
+	pop r24
+	ret
+
+sleep_5ms:
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	ret
+
+;||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+; first loop designed to clear 11 spcaes by placng them as 0 so that we can store the request array
+set_0_request_array:	
+	push r25
+	push r16
+	push YH
+	push YL
+	ldi r25, 0
+	ldi r16, 0
+	ldi YH, high(request_array)
+	ldi YL, low(request_array)
+loop_to_set_0_request_array:
+	cpi r25, 11
+	brsh loop_to_set_0_request_array_end
+	st Y+, r16
+	inc r25
+	rjmp loop_to_set_0_request_array
+loop_to_set_0_request_array_end:
+	pop YL
+	pop YH
+	pop r16
+	pop r25
+
+; this loop is designed to clear 11 spcaes by placng them as 0 so that we can store the up array
+set_0_up_array:
+	push r25
+	push r16
+	push YH
+	push YL
+	ldi r25, 0
+	ldi r16, 0
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+loop_to_set_0_up_array:
+	cpi r25, 11
+	brsh loop_to_set_0_up_array_end
+	st Y+, r16
+	inc r25
+	rjmp loop_to_set_0_up_array
+loop_to_set_0_up_array_end:
+	pop YL
+	pop YH
+	pop r16
+	pop r25
+
+; this loop is designed to clear 11 spcaes by placng them as 0 so that we can store the down array
+set_0_down_array:
+	push r25
+	push r16
+	push YH
+	push YL
+	ldi r25, 0
+	ldi r16, 0
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+loop_to_set_0_down_array:
+	cpi r25, 11
+	brsh loop_to_set_0_down_array_end
+	st Y+, r16
+	inc r25
+	rjmp loop_to_set_0_down_array
+loop_to_set_0_down_array_end:
+	pop YL
+	pop YH
+	pop r16
+	pop r25
+
+	ret
+
+;|||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+; this functon is designed to insert a requested floor in the appropriate position 
+insert_in_arrays:
+	push YH
+	push YL
+	push r17
+
+	; if the emergency flag is raised the function is to skip the insertion proccess altogether
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ld r16, Y
+	cpi r16, 1
+	breq insert_in_arrays_for_fin
+
+	; if code blue is active exit function immediatly
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ld r16, Y
+	cpi r16, 1
+	breq insert_in_arrays_for_fin
+
+	; if not checking for number skip
+	ldi YH, high(check_code_blue_number)
+	ldi YL, low(check_code_blue_number)
+	ld r16, Y
+	cpi r16, 1
+	brne insert_in_arrays_skip_codeblue
+
+	; set code blue
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ldi r16, 1
+	st Y, r16
+
+	; deactivate the number checker
+	ldi YH, high(check_code_blue_number)
+	ldi YL, low(check_code_blue_number)
+	ldi r16, 0
+	st Y, r16
+
+	rcall set_0_request_array
+
+
+insert_in_arrays_skip_codeblue:
+	; load the current floor and using the requested floor we can compare and determine whether the request should be placed in the up or down array
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+
+	; if the requested floor is 0 change it to 10 as per the requirements
+	cpi req_floor, 0
+	brne insert_in_arrays_continue 
+	
+	ldi req_floor, 10
+insert_in_arrays_continue:
+	; if the current floor is lower than the requested place the request in the up array
+	; if the current floor is higher than the requested place place the request in the down array
+	cp r16, req_floor
+
+	breq insert_in_arrays_for_fin
+	brlo insert_in_arrays_for_up 	
+	brsh insert_in_arrays_for_dwn
+insert_in_arrays_for_up:
+	; call the function that place the request in up
+	rcall insert_for_arrayUp
+	rjmp insert_in_arrays_for_fin
+insert_in_arrays_for_dwn:
+	; call the function that place the request in down
+	rcall insert_for_arrayDwn
+	rjmp insert_in_arrays_for_fin
+
+insert_in_arrays_for_fin:	
+	; if code blue is still on and there are no more requests that means
+	; the elevator has reahed and so we set the code blue back to 0
+
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ldi r16, 1
+	brne insert_in_arrays_for_returncall
+	
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+	ld r16, Y
+	cpi r16, 0
+	brne insert_in_arrays_for_returncall
+
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+	ld r16, Y
+	cpi r16, 0
+	brne insert_in_arrays_for_returncall
+
+
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ldi r16, 0
+	st Y, r16
+
+	rjmp insert_in_arrays_for_returncall
+
+
+insert_in_arrays_for_returncall:	
+	pop r17
+	pop YL
+	pop YH
+	ret
+
+; ||||||||||||||||||||||||||||||||||||||||||||||||||
+insert_for_arrayUp:
+	push YL
+	push YH
+	push r17
+	push r18
+
+	; load array
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+
+insert_for_arrayUp_postition_loop:
+	ld r17, Y
+	
+	; if no value at position place mmmediatly	
+	cpi r17, 0
+	breq insert_for_arrayUp_insert_immediatly
+
+	; if already exist then just exit but if greater jump to another branch
+	cp req_floor, r17
+	breq insert_for_arrayUp_end
+	brlo insert_for_arrayUp_insert_at_postion
+
+	; move adress if appropriate spot is not found
+	adiw Y, 1
+
+	rjmp insert_for_arrayUp_postition_loop
+	 
+	 ; call will insert at the said location
+insert_for_arrayUp_insert_at_postion:
+	ld r18, Y
+	st Y+, req_floor
+	; shift all value to the right so a space is allocated for the new floor 
+	; number but also to make sure no number is lost
+	rcall shift_to_right
+	rjmp insert_for_arrayUp_end
+
+insert_for_arrayUp_insert_immediatly:
+	; if position is empty place immediatly
+	st Y, req_floor
+	rjmp insert_for_arrayUp_end
+
+insert_for_arrayUp_end:
+	pop r18
+	pop r17
+	pop YH
+	pop YL
+	
+	ret
+
+; ||||||||||||||||||||||||||||||||||||||||||||||
+insert_for_arrayDwn:
+	push YL
+	push YH
+	push r17
+	push r18
+	
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+
+insert_for_arrayDwn_postition_loop:
+	ld r17, Y
+
+	; if no value at position place mmmediatly	
+	cpi r17, 0
+	breq insert_for_arrayDwn_insert_immediatly
+
+	; if already exist then just exit but if greater jump to another branch
+	cp req_floor, r17
+	breq insert_for_arrayDwn_end
+	brsh insert_for_arrayDwn_insert_at_postion
+
+	; move adress if appropriate spot is not found
+	adiw Y, 1
+
+	rjmp insert_for_arrayDwn_postition_loop
+	 
+	 ; call will insert at the said location
+insert_for_arrayDwn_insert_at_postion:
+	ld r18, Y
+	st Y+, req_floor
+	; shift all value to the right so a space is allocated for the new floor 
+	; number but also to make sure no number is lost
+	rcall shift_to_right
+	rjmp insert_for_arrayDwn_end
+
+	
+insert_for_arrayDwn_insert_immediatly:
+	; if position is empty place immediatly
+	st Y, req_floor
+	rjmp insert_for_arrayDwn_end
+
+insert_for_arrayDwn_end:
+	pop r18
+	pop r17
+	pop YH
+	pop YL
+	
+	ret
+
+; ||||||||||||||||||||||||||||||||||||||||||||||||
+; this functions prupose is to shift all values at a certain position to the right,
+; in a manner that no data is lost or gained
+shift_to_right:
+	push r19
+	push r18
+	push XL
+	push XH
+	push YL
+	push YH
+
+	
+	; r18 will act as the previous value and r19 will store the new value
+	; this loop will continue until reacehs the end (0)
+shift_to_right_loop:
+	mov r19, r18
+	ld r18, Y
+	st Y+, r19
+
+	cpi r18, 0
+	breq return_call_for_shift_right
+
+	rjmp shift_to_right_loop
+
+return_call_for_shift_right:
+	pop YH
+	pop YL
+	pop XH
+	pop XL
+	pop r18
+	pop r19
+	ret
+; |||||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+; |||||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+; the role of this function is to check whether a requested floor has been reached and then exectuing various 
+; functions so that the system does not break
+check_floor_reached:
+	push r16
+	push r17
+	push YL
+	push YH
+	push ZL
+	push ZH
+
+	; laod the current floor will be used to compare the first value from both
+	; the up and down array in order to determine whether the requested floor has been reached
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+	
+	; first check in the up array that a floor has been reached
+	ldi ZH, high(up_array)
+	ldi ZL, low(up_array)
+	ld r17, Z
+
+	cp r16, r17
+	breq call_for_shift_up
+	rjmp check_floor_reached_con
+
+call_for_shift_up:
+	; if floor in up array remove it as signal that we have reached the floor
+	rcall shift_up_values
+	rcall set_open_doors
+	rjmp check_floor_reached_end
+
+check_floor_reached_con:
+	
+	; now check the down array whether we have reached a floor
+	ldi ZH, high(down_array)
+	ldi ZL, low(down_array)
+	ld r17, Z
+
+	cp r16, r17
+	breq call_for_shift_dwn
+	rjmp check_floor_reached_end
+call_for_shift_dwn:	
+	; if floor in down array remove it as signal that we have reached the floor
+	rcall shift_down_values
+	rcall set_open_doors
+	rjmp check_floor_reached_end
+
+check_floor_reached_end:
+	; return call
+	pop ZH
+	pop ZL
+	pop YH
+	pop YL
+	pop r17
+	pop r16
+
+	ret
+
+
+	; this function is concering the rmeoving the values in the up array
+shift_up_values:
+	push r16
+	push r17
+	push YL
+	push YH
+	push ZL
+	push ZH
+
+	ldi YH, high(floor_reached)
+	ldi YL, low(floor_reached)
+	ldi r16, 1
+	st Y, r16
+
+	ldi YH, high(SecondCounter)
+	ldi YL, low(SecondCounter)
+	ldi r16, 0
+	st Y, r16
+	ldi YH, high(TempCounter)
+	ldi YL, low(TempCounter)
+	ldi r16, 0
+	st Y, r16
+	
+	; load the 2 arrays and one will always be ahead of the other by 1
+	; the point is too move the value ahead to the one behding thus shifting all values down
+
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+	
+	ldi ZH, high(up_array)
+	ldi ZL, low(up_array)
+
+	; loop will stop once the adress ahead reaches a 0 value
+shift_up_values_loop:
+	adiw Z, 1
+	ld r16, Z
+	st Y, r16
+
+	adiw Y, 1
+
+	cpi r16, 0
+	breq shift_up_values_end
+
+	rjmp shift_up_values_loop
+
+shift_up_values_end:
+	pop ZH
+	pop ZL
+	pop YH
+	pop YL
+	pop r17
+	pop r16
+	ret
+
+	; this function is concering the rmeoving the values in the down array
+shift_down_values:
+	push r16
+	push r17
+	push YL
+	push YH
+	push ZL
+	push ZH
+
+	ldi YH, high(floor_reached)
+	ldi YL, low(floor_reached)
+	ldi r16, 1
+	st Y, r16
+
+	ldi YH, high(SecondCounter)
+	ldi YL, low(SecondCounter)
+	ldi r16, 0
+	st Y, r16
+	ldi YH, high(TempCounter)
+	ldi YL, low(TempCounter)
+	ldi r16, 0
+	st Y, r16
+
+
+	; load the 2 arrays and one will always be ahead of the other by 1
+	; the point is too move the value ahead to the one behding thus shifting all values down
+	
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+	
+	ldi ZH, high(down_array)
+	ldi ZL, low(down_array)
+
+	; loop will stop once the adress ahead reaches a 0 value
+shift_down_values_loop:
+	adiw Z, 1
+	ld r16, Z
+	st Y, r16
+
+	adiw Y, 1
+
+	cpi r16, 0
+	breq shift_down_values_end
+
+	rjmp shift_down_values_loop
+
+shift_down_values_end:
+	; return call
+	
+	pop ZH
+	pop ZL
+	pop YH
+	pop YL
+	pop r17
+	pop r16
+	ret
+
+; |||||||||||||||||||||||||||||||||||||||||||||||||||||
+; this function will be concerned with the changing of the current floor number
+change_floor:
+	push YL
+	push YH
+	push r16
+	
+	ldi YH, high(emergency_clearance_mode)
+	ldi YL, low(emergency_clearance_mode)
+	ld r16, Y
+	cpi r16, 1
+	breq change_floor_finished
+
+	; depending on whether the elevator ismoving up or down bahve in a certain way
+	ldi YH, high(movement)
+	ldi YL, low(movement)
+	ld r16, Y
+
+	; change the floor based on if the current sitation is going up
+	cpi r16, 1
+	breq check_going_up
+
+	; change the floor based on if the current sitation is going down
+	cpi r16, 0
+	breq check_going_down
+
+check_going_up:	
+	; if the up array is not 0 go up by 1
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+	ld r16, Y
+
+	cpi r16, 0
+	brne increment_floor
+	
+	; if the up array is not 0 go down by 1
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+	ld r16, Y
+
+	cpi r16, 0
+	breq change_floor_finished
+
+	rjmp decrement_floor
+
+check_going_down:			
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+	ld r16, Y
+
+	; if the up array is not 0 go down by 1
+	cpi r16, 0
+	brne decrement_floor
+	
+	; if the up array is not 0 go up by 1
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+	ld r16, Y
+
+	cpi r16, 0
+	breq change_floor_finished
+
+	rjmp increment_floor
+
+increment_floor:
+	; take current floor, increment that number and store it back again
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+	inc r16
+	st Y, r16
+
+	ldi YH, high(movement)
+	ldi YL, low(movement)
+	ldi r16, 1
+	st Y, r16
+
+	rcall create_movement_message
+
+	rjmp change_floor_finished
+
+decrement_floor:
+	; take current floor, decrement that number and store it back again
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+	dec r16
+	st Y, r16
+
+	ldi YH, high(movement)
+	ldi YL, low(movement)
+	ldi r16, 0
+	st Y, r16
+
+	rcall create_movement_message
+
+	rjmp change_floor_finished	
+	
+change_floor_finished:
+
+	pop r16
+	pop YH
+	pop YL
+	ret
+; ||||||||||||||||||||||||||||||||||||||||||||
+; this entire fucnctin role wll be to dislay the appropiate message
+create_movement_message: 
+	push YH 
+	push YL
+	push temp
+	push temp2
+
+	do_lcd_command 0b00000001 ; clear display
+
+	; check if the emergecy has been raised and if so act appropriatly
+	ldi YH, high(emergency_mode)
+	ldi YL, low(emergency_mode)
+	ld r16, Y
+	cpi r16, 1
+	breq emergency_check2
+	rjmp display_codeblue
+
+emergency_check2:
+	ldi YH, high(close_doors)
+	ldi YL, low(close_doors)
+	ld r16, Y
+	cpi r16, 1
+	breq emergency_check3
+	rjmp display_codeblue
+emergency_check3:
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld r16, Y
+	cpi r16, 1
+	breq display_emergency
+	rjmp display_codeblue
+
+
+display_emergency:
+	do_lcd_data 'E'
+	do_lcd_data 'm'
+	do_lcd_data 'e'
+	do_lcd_data 'r'
+	do_lcd_data 'g'
+	do_lcd_data 'e'
+	do_lcd_data 'n'
+	do_lcd_data 'c'
+	do_lcd_data 'y'
+	do_lcd_command 0b11000000 ; move cursor to line 2
+	do_lcd_data 'C'
+	do_lcd_data 'a'
+	do_lcd_data 'l'
+	do_lcd_data 'l'
+	do_lcd_data ' '
+	do_lcd_data '0'
+	do_lcd_data '0'
+	do_lcd_data '0'
+
+	rjmp display_stop_end
+
+display_codeblue:
+	; check if the emergecy has been raised and if so act appropriatly
+	ldi YH, high(code_blue_mode)
+	ldi YL, low(code_blue_mode)
+	ld r16, Y
+	cpi r16, 1
+	brne display_movement
+
+	do_lcd_data 'E'
+	do_lcd_data 'm'
+	do_lcd_data 'e'
+	do_lcd_data 'r'
+	do_lcd_data 'g'
+	do_lcd_data 'e'
+	do_lcd_data 'n'
+	do_lcd_data 'c'
+	do_lcd_data 'y'
+	do_lcd_command 0b11000000 ; move cursor to line 2
+	do_lcd_data 'C'
+	do_lcd_data 'O'
+	do_lcd_data 'D'
+	do_lcd_data 'E'
+	do_lcd_data ' '
+	do_lcd_data 'B'
+	do_lcd_data 'L'
+	do_lcd_data 'U'
+	do_lcd_data 'E'
+
+	rjmp display_stop_end
+
+; display the current floor and the next floor 
+display_movement:	
+	do_lcd_data 'C'
+	do_lcd_data 'U'
+	do_lcd_data 'R'
+	do_lcd_data 'R'
+	do_lcd_data 'R'
+	do_lcd_data 'E'
+	do_lcd_data 'N'
+	do_lcd_data 'T'
+	do_lcd_data ' '
+	do_lcd_data 'F'
+	do_lcd_data 'L'
+	do_lcd_data 'R'
+	do_lcd_data ' '
+
+	ldi YH, high(current_floor)
+	ldi YL, low(current_floor)
+	ld temp, Y
+
+	cpi temp, 10
+	brne next_stop
+	
+	do_lcd_data '1'
+	do_lcd_data '0'
+
+; go to second line and print the next line
+next_stop:
+	ldi temp2, 48
+	add temp, temp2
+	mov LCDUSAGE, temp
+	rcall lcd_data
+	rcall lcd_wait
+
+	do_lcd_command 0b11000000
+
+	do_lcd_data 'N'
+	do_lcd_data 'E'
+	do_lcd_data 'X'
+	do_lcd_data 'T'
+	do_lcd_data ' '
+	do_lcd_data 'S'
+	do_lcd_data 'T'
+	do_lcd_data 'O'
+	do_lcd_data 'P'
+	do_lcd_data ' '
+
+	ldi YH, high(movement)
+	ldi YL, low(movement)
+	ld temp, Y
+
+	cpi temp, 1
+	breq stop_is_up
+	cpi temp, 0
+	breq stop_is_down
+
+; function call to display 10
+stop_is_up:
+	ldi YH, high(up_array)
+	ldi YL, low(up_array)
+	ld temp, Y
+
+	cpi temp, 10
+	breq display_10_for_stop
+
+	rjmp display_stop
+	
+stop_is_down:
+	ldi YH, high(down_array)
+	ldi YL, low(down_array)
+	ld temp, Y
+
+	cpi temp, 10
+	breq display_10_for_stop
+
+	rjmp display_stop
+
+display_stop:
+	ldi temp2, 48
+	add temp, temp2
+	mov LCDUSAGE, temp
+	rcall lcd_data
+	rcall lcd_wait
+
+display_stop_end:
+	; return call
+	pop temp2
+	pop temp
+	pop YL
+	pop YH
+	ret
+
+display_10_for_stop:
+	; display 10
+	do_lcd_data '1'
+	do_lcd_data '0'
+
+	rjmp display_stop_end
+
+; displaying clearance message
+display_clearance_messg:
+	do_lcd_command 0b00000001 ; clear display
+	do_lcd_data 'C'
+	do_lcd_data 'L'
+	do_lcd_data 'E'
+	do_lcd_data 'A'
+	do_lcd_data 'R'
+	do_lcd_data ' '
+	do_lcd_data 'L'
+	do_lcd_data 'I'
+	do_lcd_data 'F'
+	do_lcd_data 'T'
+	
+	ret
+
+;|||||||||||||||||||||||||||||||||||||||||
+set_open_doors:
+	push r16
+	push YL
+	push YH
+
+	;switch motor on
+	ldi r18, 0xFF
+	sts OCR3BH, r18
+	sts OCR3BL, r18
+	ldi r18,(1<<CS30)
+	sts TCCR3B, r18
+	ldi r18,(1<<WGM30)|(1<<COM3B1)
+	sts TCCR3A, r18
+
+	; set open door to 1
+	ldi YH, high(open_doors)
+	ldi YL, low(open_doors)
+	ldi r16, 1
+	st Y, r16
+
+	; set close door to 0
+	ldi YH, high(close_doors)
+	ldi YL, low(close_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set hold door to 0
+	ldi YH, high(hold_doors)
+	ldi YL, low(hold_doors)
+	ldi r16, 0
+	st Y, r16
+
+	pop YH
+	pop YL
+	pop r16
+
+	ret
+
+set_close_doors:
+	push r16
+	push YL
+	push YH
+
+	;switch motor off
+	ldi r18, 0xFF
+	sts OCR3BH, r18
+	sts OCR3BL, r18
+	ldi r18,(1<<CS30)
+	sts TCCR3B, r18
+	ldi r18,(1<<WGM30)|(1<<COM3B1)
+	sts TCCR3A, r18
+
+	; set open door to 0
+	ldi YH, high(open_doors)
+	ldi YL, low(open_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set close door to 1
+	ldi YH, high(close_doors)
+	ldi YL, low(close_doors)
+	ldi r16, 1
+	st Y, r16
+
+	; set hold door to 0
+	ldi YH, high(hold_doors)
+	ldi YL, low(hold_doors)
+	ldi r16, 0
+	st Y, r16
+
+	pop YH
+	pop YL
+	pop r16
+
+	ret
+
+set_hold_doors:
+	push r16
+	push YL
+	push YH
+
+	;switch motor on
+	ldi r18, 0x00
+	sts OCR3BH, r18
+	sts OCR3BL, r18
+	ldi r18,(1<<CS30)
+	sts TCCR3B, r18
+	ldi r18,(1<<WGM30)|(1<<COM3B1)
+	sts TCCR3A, r18
+
+	; set open door to 0
+	ldi YH, high(open_doors)
+	ldi YL, low(open_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set close door to 0
+	ldi YH, high(close_doors)
+	ldi YL, low(close_doors)
+	ldi r16, 0
+	st Y, r16
+
+	; set hold door to 1
+	ldi YH, high(hold_doors)
+	ldi YL, low(hold_doors)
+	ldi r16, 1
+	st Y, r16
+
+	pop YH
+	pop YL
+	pop r16
+
+	ret
